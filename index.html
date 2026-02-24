@@ -38,7 +38,7 @@
 
     .topbar input {
       flex: 1;
-      max-width: 260px;
+      max-width: 220px;
       padding: 10px 14px;
       border: 1.5px solid #ddd;
       border-radius: 10px;
@@ -48,6 +48,49 @@
     }
     .topbar input:focus { border-color: #FF385C; }
     .topbar input::placeholder { color: #aaa; }
+
+    .topbar-divider {
+      font-size: 13px;
+      color: #bbb;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    /* ── Experience group header (collection mode) ── */
+    .experience-group {
+      margin-bottom: 32px;
+    }
+
+    .experience-group-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 0 14px;
+      border-bottom: 2px solid #f0f0f0;
+      margin-bottom: 4px;
+    }
+
+    .experience-group-id {
+      font-size: 11px;
+      font-weight: 700;
+      color: #fff;
+      background: #FF385C;
+      border-radius: 6px;
+      padding: 2px 8px;
+      letter-spacing: 0.04em;
+    }
+
+    .experience-group-name {
+      font-size: 15px;
+      font-weight: 700;
+      color: #111;
+    }
+
+    .experience-group-error {
+      font-size: 13px;
+      color: #c0392b;
+      padding: 12px 0 8px;
+    }
 
     .btn-generate {
       background: #FF385C;
@@ -304,6 +347,15 @@
       autocorrect="off"
       spellcheck="false"
     />
+    <span class="topbar-divider">or</span>
+    <input
+      type="text"
+      id="collection-input"
+      placeholder="Collection ID (e.g. 212)"
+      autocomplete="off"
+      autocorrect="off"
+      spellcheck="false"
+    />
     <button class="btn-generate" id="btn-generate">
       <span class="spinner"></span>
       <span class="btn-label">Generate</span>
@@ -327,7 +379,7 @@
             <rect x="3" y="3" width="18" height="18" rx="3"/>
             <path d="M3 9h18M9 21V9"/>
           </svg>
-          <p>Enter an experience ID and click Generate<br/>to see the visual preview here.</p>
+          <p>Enter an Experience ID or Collection ID and click Generate<br/>to see the visual preview here.</p>
         </div>
         <div class="preview-list" id="preview-list" style="display:none;"></div>
       </div>
@@ -368,38 +420,51 @@
 
   <script>
     // ── DOM refs ──
-    const input      = document.getElementById("tgid-input");
-    const btnGen     = document.getElementById("btn-generate");
-    const btnCopy    = document.getElementById("btn-copy");
-    const errBanner  = document.getElementById("error-banner");
-    const previewEmpty = document.getElementById("preview-empty");
-    const previewList  = document.getElementById("preview-list");
-    const jsonEmpty    = document.getElementById("json-empty");
-    const jsonWrap     = document.getElementById("json-output-wrap");
-    const jsonOut      = document.getElementById("json-output");
+    const input           = document.getElementById("tgid-input");
+    const collectionInput = document.getElementById("collection-input");
+    const btnGen          = document.getElementById("btn-generate");
+    const btnCopy         = document.getElementById("btn-copy");
+    const errBanner       = document.getElementById("error-banner");
+    const previewEmpty    = document.getElementById("preview-empty");
+    const previewList     = document.getElementById("preview-list");
+    const jsonEmpty       = document.getElementById("json-empty");
+    const jsonWrap        = document.getElementById("json-output-wrap");
+    const jsonOut         = document.getElementById("json-output");
 
     // ── State ──
     let currentJson = null;
 
-    // ── Enter key shortcut ──
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") handleGenerate();
+    // ── Mutual exclusivity: clear the other input when one is typed into ──
+    input.addEventListener("input", () => {
+      if (input.value.trim()) collectionInput.value = "";
     });
+    collectionInput.addEventListener("input", () => {
+      if (collectionInput.value.trim()) input.value = "";
+    });
+
+    // ── Enter key shortcut ──
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") handleGenerate(); });
+    collectionInput.addEventListener("keydown", (e) => { if (e.key === "Enter") handleGenerate(); });
 
     btnGen.addEventListener("click", handleGenerate);
     btnCopy.addEventListener("click", handleCopy);
 
-    // ── Generate ──
+    // ── Generate — detects mode from which input is filled ──
     async function handleGenerate() {
-      const experienceId = input.value.trim();
+      const experienceId  = input.value.trim();
+      const collectionId  = collectionInput.value.trim();
 
-      // Frontend validation
-      if (!experienceId) {
-        showError("Please enter an Experience ID.");
+      // Determine mode
+      if (!experienceId && !collectionId) {
+        showError("Please enter an Experience ID or a Collection ID.");
         return;
       }
-      if (!/^\d+$/.test(experienceId)) {
+      if (experienceId && !/^\d+$/.test(experienceId)) {
         showError("Experience ID should be a number (e.g. 6274).");
+        return;
+      }
+      if (collectionId && !/^\d+$/.test(collectionId)) {
+        showError("Collection ID should be a number (e.g. 212).");
         return;
       }
 
@@ -408,20 +473,27 @@
       clearOutputs();
 
       try {
-        const res = await fetch("/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ experienceId }),
-        });
-
-        const payload = await res.json();
-
-        if (!payload.success) {
-          showError(payload.error || "Something went wrong. Please try again.");
-          return;
+        if (experienceId) {
+          // ── Single experience mode ──
+          const res = await fetch("/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ experienceId }),
+          });
+          const payload = await res.json();
+          if (!payload.success) { showError(payload.error || "Something went wrong."); return; }
+          renderSingleResult(payload.data);
+        } else {
+          // ── Collection mode ──
+          const res = await fetch("/api/generate-collection", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ collectionId }),
+          });
+          const payload = await res.json();
+          if (!payload.success) { showError(payload.error || "Something went wrong."); return; }
+          renderCollectionResult(payload.data);
         }
-
-        renderResults(payload.data);
       } catch (err) {
         showError("Network error — is the server running?");
         console.error(err);
@@ -430,35 +502,78 @@
       }
     }
 
-    // ── Render ──
-    function renderResults(data) {
+    // ── Render: single experience ──
+    function renderSingleResult(data) {
       currentJson = data;
-      renderPreview(data.sections);
+      renderSections(previewList, data.sections);
+      previewEmpty.style.display = "none";
+      previewList.style.display = "flex";
       renderJson(data);
     }
 
-    function renderPreview(sections) {
+    // ── Render: collection (one labelled group per experience) ──
+    function renderCollectionResult(data) {
+      currentJson = data;
       previewList.innerHTML = "";
 
+      data.experiences.forEach((exp) => {
+        const group = document.createElement("div");
+        group.className = "experience-group";
+
+        // Header: ID badge + experience name
+        const header = document.createElement("div");
+        header.className = "experience-group-header";
+
+        const badge = document.createElement("span");
+        badge.className = "experience-group-id";
+        badge.textContent = `ID ${exp.experienceId}`;
+
+        const nameEl = document.createElement("span");
+        nameEl.className = "experience-group-name";
+        nameEl.textContent = exp.experienceName;
+
+        header.appendChild(badge);
+        header.appendChild(nameEl);
+        group.appendChild(header);
+
+        if (exp.error) {
+          // Show error inline for failed experiences rather than aborting the whole collection
+          const errEl = document.createElement("div");
+          errEl.className = "experience-group-error";
+          errEl.textContent = `Could not generate: ${exp.error}`;
+          group.appendChild(errEl);
+        } else {
+          // Render the stop cards inside this group
+          const list = document.createElement("div");
+          list.className = "preview-list";
+          renderSections(list, exp.sections);
+          group.appendChild(list);
+        }
+
+        previewList.appendChild(group);
+      });
+
+      previewEmpty.style.display = "none";
+      previewList.style.display = "flex";
+      renderJson(data);
+    }
+
+    // ── Shared section card renderer ──
+    function renderSections(container, sections) {
       sections.forEach((section) => {
         const card = document.createElement("div");
         card.className = "stop-card";
-        // Data attributes for future Edit button hooks
         card.dataset.sectionId = section.id;
 
         // Thumbnail
         const thumb = document.createElement("div");
         thumb.className = "stop-thumb";
-
         if (section.mediaUrls && section.mediaUrls[0]) {
           const img = document.createElement("img");
           img.src = section.mediaUrls[0];
           img.alt = section.name;
           img.loading = "lazy";
-          // Fallback if image fails
-          img.onerror = () => {
-            img.replaceWith(makePlaceholder(section.name));
-          };
+          img.onerror = () => { img.replaceWith(makePlaceholder(section.name)); };
           thumb.appendChild(img);
         } else {
           thumb.appendChild(makePlaceholder(section.name));
@@ -486,15 +601,11 @@
 
         content.appendChild(title);
         content.appendChild(desc);
-        content.appendChild(actions); // hidden via CSS until feature is built
-
+        content.appendChild(actions);
         card.appendChild(thumb);
         card.appendChild(content);
-        previewList.appendChild(card);
+        container.appendChild(card);
       });
-
-      previewEmpty.style.display = "none";
-      previewList.style.display = "flex";
     }
 
     function makePlaceholder(name) {
@@ -507,7 +618,6 @@
     function renderJson(data) {
       const formatted = JSON.stringify(data, null, 2);
       jsonOut.innerHTML = syntaxHighlight(formatted);
-
       jsonEmpty.style.display = "none";
       jsonWrap.style.display = "block";
       btnCopy.style.display = "flex";
@@ -519,19 +629,14 @@
       try {
         await navigator.clipboard.writeText(JSON.stringify(currentJson, null, 2));
         btnCopy.classList.add("copied");
-        btnCopy.querySelector("span") // update label if span exists
-          ? null : null;
         const label = btnCopy.childNodes[btnCopy.childNodes.length - 1];
-        if (label && label.nodeType === Node.TEXT_NODE) {
-          label.textContent = " Copied!";
-        }
+        if (label && label.nodeType === Node.TEXT_NODE) label.textContent = " Copied!";
         setTimeout(() => {
           btnCopy.classList.remove("copied");
           const l2 = btnCopy.childNodes[btnCopy.childNodes.length - 1];
           if (l2 && l2.nodeType === Node.TEXT_NODE) l2.textContent = " Copy to Clipboard";
         }, 2000);
       } catch {
-        // Fallback: select the pre text
         const range = document.createRange();
         range.selectNode(jsonOut);
         window.getSelection().removeAllRanges();
@@ -566,14 +671,11 @@
     }
 
     // ── Syntax highlight ──
-    // Simple regex-based highlighter for the JSON pre block
     function syntaxHighlight(json) {
-      // Escape HTML first
       json = json
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
-
       return json.replace(
         /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
         (match) => {

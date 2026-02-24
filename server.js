@@ -7,6 +7,17 @@ const OpenAI = require("openai");
 const app = express();
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Custom error type — thrown when an experience has no itinerary
+// ---------------------------------------------------------------------------
+class NoItineraryError extends Error {
+  constructor(experienceId) {
+    super(`Experience ${experienceId} does not have an itinerary and cannot be generated.`);
+    this.name = "NoItineraryError";
+    this.experienceId = experienceId;
+  }
+}
+
 // Serve the single-page frontend
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
@@ -46,27 +57,15 @@ async function fetchJson(url) {
 }
 
 // ---------------------------------------------------------------------------
-// Main route
+// Core generation logic — reusable for single experience and collection modes
 // ---------------------------------------------------------------------------
 
-app.post("/api/generate", async (req, res) => {
-  const { experienceId } = req.body;
-
-  // --- Input validation ---
-  if (!experienceId || String(experienceId).trim() === "") {
-    return res.status(400).json({ success: false, error: "Experience ID is required." });
-  }
-  const id = String(experienceId).trim();
-
-  // --- Validate API key early ---
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({
-      success: false,
-      error: "OPENAI_API_KEY is not configured on the server.",
-    });
-  }
-
-  try {
+/**
+ * Generate itinerary sections for a single experience ID.
+ * Returns { experienceId, experienceName, sections } on success.
+ * Throws an Error on failure (caller decides how to surface it).
+ */
+async function generateForExperience(id) {
     // -----------------------------------------------------------------
     // 1. Call Experience API
     // -----------------------------------------------------------------
@@ -84,14 +83,19 @@ app.post("/api/generate", async (req, res) => {
       Array.isArray(experience.experienceItineraryIds) &&
       experience.experienceItineraryIds.length > 0;
 
+    // Hard stop — no itinerary data means we cannot generate content
+    if (!hasItineraryIds) {
+      throw new NoItineraryError(id);
+    }
+
     // -----------------------------------------------------------------
-    // 2. Call Itinerary API (only if itinerary IDs exist)
+    // 2. Call Itinerary API
     // -----------------------------------------------------------------
     let stopSections = [];       // Only STOP-type sections
     let durationText = "";
     let modeOfTravel = "";
 
-    if (hasItineraryIds) {
+    {
       const itineraryUrl = `https://api.headout.com/api/v6/tour-groups/${id}/experience-itineraries/?sections=true`;
       const itineraryData = await fetchJson(itineraryUrl);
 
@@ -195,13 +199,20 @@ Sources to analyse:
 - Highlights, inclusions, summary, metaTitle, metaDescription (these may contain additional experiences not listed as stops — include them if they describe something the guest actively sees, does, or visits)
 
 Strict rules:
-- Only include experiences explicitly mentioned or clearly implied by the provided text
+- Every itinerary stop listed below MUST appear in your output — never drop or skip a stop entirely. Combining adjacent stops (when count > 8) is permitted, but every stop must be accounted for in at least one output card
+- Only include additional experiences (from highlights/inclusions/summary) if they describe something the guest actively sees, does, or visits that is not already covered by an itinerary stop
 - Never invent experiences not present in the text
-- Exclude: transfers, coach rides, pickups, dropoffs, hotel collection, meeting points, audio guides, bottled water, onboard commentary
+- Exclude from non-itinerary sources only: transfers, coach rides, pickups, dropoffs, hotel collection, meeting points, audio guides, bottled water, onboard commentary
 - If the same place or activity appears in multiple sources, list it once using the richest description available
 - For each experience, assign a significance score 1–10 (10 = headline attraction, 1 = minor pass-by)
 - For each experience, assign contextQuality: "high" (100+ words of specific detail available), "medium" (30–100 words), "low" (under 30 words or very generic)
 - Note which source you found it in: "itinerary" | "highlights" | "inclusions" | "summary"
+
+Separation rules — never merge these into adjacent stops:
+- A landscape, plain, valley, viewpoint, or countryside mentioned as a distinct place or moment must be listed as its own experience — do not fold it into a nearby venue or monument
+- A visitor centre, museum, or exhibition is always a separate experience from the monument or site it relates to
+- A pass-by stop is always separate from a full-entry stop, even if they are geographically close
+- A named sub-attraction within a stop (e.g. a chapel, apartment, or gallery inside a castle) must be listed as its own experience if it is explicitly described with distinct content
 
 [EXPERIENCE DATA]
 Title: ${experienceName}
@@ -237,7 +248,7 @@ Output a raw JSON array only — no markdown, no explanation:
 
     const call1Completion = await openai.chat.completions.create({
       model: "gpt-4o",
-      temperature: 0.2,
+      temperature: 0,
       messages: [
         { role: "system", content: call1SystemPrompt },
         { role: "user", content: call1UserPrompt },
@@ -254,19 +265,11 @@ Output a raw JSON array only — no markdown, no explanation:
     try {
       call1Result = JSON.parse(call1Cleaned);
     } catch {
-      return res.status(500).json({
-        success: false,
-        error: "Call 1 (extraction) returned output that could not be parsed. Please try again.",
-        rawOutput: call1Raw,
-      });
+      throw new Error("Call 1 (extraction) returned output that could not be parsed. Please try again.");
     }
 
     if (!Array.isArray(call1Result)) {
-      return res.status(500).json({
-        success: false,
-        error: "Call 1 (extraction) returned an unexpected structure. Please try again.",
-        rawOutput: call1Raw,
-      });
+      throw new Error("Call 1 (extraction) returned an unexpected structure. Please try again.");
     }
 
     console.log("CALL 1 EXTRACTION:", JSON.stringify(call1Result, null, 2));
@@ -286,7 +289,9 @@ Output a raw JSON array only — no markdown, no explanation:
     function overlapRatio(nameA, nameB) {
       const a = wordSet(nameA);
       const b = wordSet(nameB);
-      if (a.size === 0 || b.size === 0) return 0;
+      // Never deduplicate if either name is a single word — a monument and a
+      // venue inside that monument will share the monument name but are distinct.
+      if (a.size <= 1 || b.size <= 1) return 0;
       const intersection = [...a].filter((w) => b.has(w)).length;
       const smaller = Math.min(a.size, b.size);
       return intersection / smaller;
@@ -303,7 +308,18 @@ Output a raw JSON array only — no markdown, no explanation:
         kept.push(candidate);
       } else {
         const existing = kept[dupIndex];
-        if ((candidate.significance ?? 0) > (existing.significance ?? 0)) {
+        // An itinerary-sourced entry (has itineraryStopId) always wins over a
+        // highlights/inclusions entry — it carries the correct id, rank, and media.
+        // Only fall back to significance comparison when both have or both lack an id.
+        const candidateHasId = candidate.itineraryStopId != null;
+        const existingHasId  = existing.itineraryStopId  != null;
+        const candidateWins  = candidateHasId && !existingHasId
+          ? true
+          : !candidateHasId && existingHasId
+            ? false
+            : (candidate.significance ?? 0) > (existing.significance ?? 0);
+
+        if (candidateWins) {
           removedDuplicates.push({ removed: existing.name, kept: candidate.name });
           kept[dupIndex] = candidate;
         } else {
@@ -316,8 +332,9 @@ Output a raw JSON array only — no markdown, no explanation:
       console.log("DEDUP — removed duplicates:", JSON.stringify(removedDuplicates, null, 2));
     }
 
-    // -- 5b. MediaUrl assignment --
-    // Build a lookup from itinerary stop id → mediaUrls[0]
+    // -- 5b. MediaUrl assignment — four-layer fallback --
+
+    // Build a lookup from itinerary stop id → mediaUrls[0]  (Layer 1)
     const stopMediaMap = {};
     for (const s of stopSections) {
       if (s.id != null && s.mediaUrls.length > 0) {
@@ -325,25 +342,88 @@ Output a raw JSON array only — no markdown, no explanation:
       }
     }
 
-    // Pool of experience-level images (imageUploads) for experiences not in the itinerary
-    const experienceImagePool = Array.isArray(experience.imageUploads)
-      ? experience.imageUploads.map((img) => img.url).filter(Boolean)
-      : [];
-    let imagePoolIndex = 0;
+    // Track assigned URLs globally to prevent the same image appearing on multiple cards
+    const usedMediaUrls = new Set();
 
+    // Pass 1 — Layer 1: direct itinerary stop match (itineraryStopId-linked only)
     const cleanedList = kept.map((exp) => {
       let mediaUrl = null;
-
       if (exp.itineraryStopId != null && stopMediaMap[exp.itineraryStopId]) {
-        // Matched directly to an itinerary stop
-        mediaUrl = stopMediaMap[exp.itineraryStopId];
-      } else if (imagePoolIndex < experienceImagePool.length) {
-        // Draw sequentially from experience-level image pool
-        mediaUrl = experienceImagePool[imagePoolIndex++];
+        const candidate = stopMediaMap[exp.itineraryStopId];
+        if (!usedMediaUrls.has(candidate)) {
+          mediaUrl = candidate;
+          usedMediaUrls.add(candidate);
+        }
       }
-
       return { ...exp, mediaUrl };
     });
+
+    // Pass 2 — Layers 2 → 3 → 4: sequential fallback for still-null entries
+    for (const exp of cleanedList) {
+      if (exp.mediaUrl) continue; // Layer 1 already assigned
+
+      // ── Layer 2: Wikimedia Commons ──
+      try {
+        const searchTerm = exp.name.trim().replace(/\s+/g, '_');
+        const wikiUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(searchTerm)}`;
+        const wikiRes = await fetch(wikiUrl);
+        if (wikiRes.ok) {
+          const wikiData = await wikiRes.json();
+          const thumbnail = wikiData?.thumbnail?.source;
+          if (thumbnail && !usedMediaUrls.has(thumbnail)) {
+            exp.mediaUrl = thumbnail;
+            usedMediaUrls.add(thumbnail);
+            console.log('WIKIMEDIA:', exp.name, '→', thumbnail);
+            continue; // Layer 2 succeeded — skip Layers 3 & 4
+          }
+        }
+        console.log('WIKIMEDIA:', exp.name, '→ not found');
+      } catch (wikiErr) {
+        console.warn('WIKIMEDIA error for', exp.name, ':', wikiErr.message);
+      }
+
+      // ── Layer 3: Unsplash with GPT-generated query ──
+      if (process.env.UNSPLASH_ACCESS_KEY) {
+        try {
+          const queryResponse = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            temperature: 0,
+            max_tokens: 30,
+            messages: [
+              {
+                role: 'system',
+                content: 'Return only a 3-5 word Unsplash search query for a travel photo of this specific stop. Always include the location name (city, landmark, or site) in the query. No punctuation, no explanation.',
+              },
+              {
+                role: 'user',
+                content: `Tour: ${experienceName}\nCity: ${cityName}\nStop: ${exp.name}\nDescription: ${exp.description || ''}`,
+              },
+            ],
+          });
+          const unsplashQuery = queryResponse.choices[0].message.content.trim();
+
+          const unsplashUrl = `https://api.unsplash.com/search/photos?query=${encodeURIComponent(unsplashQuery)}&per_page=5&orientation=landscape&client_id=${process.env.UNSPLASH_ACCESS_KEY}`;
+          const unsplashRes = await fetch(unsplashUrl);
+          if (unsplashRes.ok) {
+            const unsplashData = await unsplashRes.json();
+            const photo = (unsplashData?.results || []).find(r => !usedMediaUrls.has(r.urls.regular));
+            if (photo) {
+              exp.mediaUrl = photo.urls.regular;
+              exp.imageCredit = photo.user.name;
+              exp.imageCreditLink = photo.links.html;
+              usedMediaUrls.add(photo.urls.regular);
+              console.log('UNSPLASH:', exp.name, '→ query:', unsplashQuery, '→ found');
+              continue; // Layer 3 succeeded — skip Layer 4
+            }
+          }
+          console.log('UNSPLASH:', exp.name, '→ query:', unsplashQuery, '→ not found');
+        } catch (unsplashErr) {
+          console.warn('UNSPLASH error for', exp.name, ':', unsplashErr.message);
+        }
+      }
+
+      // ── Layer 4: null — leave mediaUrl as null, generation continues ──
+    }
 
     // -- 5c. sortRank assignment --
     // Every experience going into Call 2 must carry a sortRank so the final
@@ -434,6 +514,10 @@ Output a raw JSON array only — no markdown, no explanation:
     const ranked = [];
     const filteredNoise = [];
 
+    // Track how many experiences have been associated with each stop rank,
+    // so each gets a unique offset (0.1, 0.2, 0.3…) — stable sort order.
+    const stopRankOffsetCounter = {};
+
     for (const exp of cleanedList) {
       const noiseMatch = exp.name.match(noiseNameRegex);
       if (noiseMatch) {
@@ -449,10 +533,13 @@ Output a raw JSON array only — no markdown, no explanation:
         // Rule 1: direct itinerary stop match
         sortRank = stopRankMap[exp.itineraryStopId];
       } else {
-        // Rule 2: contextual association — offset +0.1 keeps it close to its parent stop
+        // Rule 2: contextual association — incrementing offset per parent stop
+        // ensures stable ordering when multiple experiences share the same parent.
         const assocStop = contextualStopMatch(exp);
         if (assocStop != null) {
-          sortRank = (assocStop.rank ?? 0) + 0.1;
+          const baseRank = assocStop.rank ?? 0;
+          stopRankOffsetCounter[baseRank] = (stopRankOffsetCounter[baseRank] ?? 0) + 0.1;
+          sortRank = baseRank + stopRankOffsetCounter[baseRank];
         } else {
           // Rule 4: no association — slot before the last stop, never dropped
           sortRank = highestStopRank - 0.5;
@@ -477,6 +564,25 @@ Output a raw JSON array only — no markdown, no explanation:
       console.log("SORT VALIDATION: bumped non-stop first item, re-sorted.");
     }
 
+    // Minimum count guarantee — if we have fewer than 3 experiences after all
+    // filtering and deduplication, pull the best dropped items back from the
+    // full call1Result pool (excluding whatever made it through already).
+    if (sortedList.length < 3) {
+      const keptNames = new Set(sortedList.map(e => e.name));
+      const candidates = call1Result
+        .filter(exp => !keptNames.has(exp.name))
+        .sort((a, b) => (b.significance ?? 0) - (a.significance ?? 0));
+
+      for (const exp of candidates) {
+        if (sortedList.length >= 3) break;
+        const fallbackRank = highestStopRank + 0.5;
+        sortedList.push({ ...exp, mediaUrl: null, sortRank: fallbackRank });
+        console.log("REINSTATED (min count):", exp.name);
+      }
+
+      sortedList.sort((a, b) => a.sortRank - b.sortRank);
+    }
+
     console.log("SORTED LIST FOR CALL 2:", JSON.stringify(sortedList, null, 2));
     console.log("COUNT AFTER NOISE FILTER:", sortedList.length);
 
@@ -484,56 +590,251 @@ Output a raw JSON array only — no markdown, no explanation:
     // 6. Call 2 — Count logic + combining + content generation
     // -----------------------------------------------------------------
 
-    const call2SystemPrompt = `You are a senior travel copywriter for Airbnb Experiences. You write itinerary content that makes people feel they've already lived the trip before booking. Style: warm, specific, first-person-friendly. Verb-led titles (3–5 words, Title Case). Descriptions that are sensory and atmospheric — what will they SEE, FEEL, HEAR, or DISCOVER at this exact spot? Never use: "you will", "guests can", "this experience", "stunning", "amazing", "beautiful". Every description must contain at least one specific detail. For experiences with low context quality, describe the atmosphere and character of the place — do not invent specific facts or statistics. You output only valid JSON.`;
+    const call2SystemPrompt = `You are a senior travel content writer for Headout.
+Your job is to convert raw tour stop data into itinerary cards that help a traveler vividly imagine what each part of the day actually looks like.
+This copy is not just informational. It should increase booking confidence by making the itinerary feel concrete, specific, and easy to picture — while staying factual and source-grounded.
 
-    const call2UserPrompt = `Below is a cleaned list of sub-experiences for a tour. Apply the count rules, then generate final itinerary copy.
+PRIMARY OBJECTIVE
+When a traveler compares the same tour across platforms, Headout's itinerary copy should make the experience easiest to imagine.
+Each card should feel like a real moment in the day, not a brochure summary.
 
-STEP 1 — COUNT CHECK: Count the experiences in the list below.
-- If count is less than 3: you MUST expand the lowest-contextQuality experiences into sub-moments before generating copy. Use the description text to find distinct moments within a single experience. Only expand if the text supports it — do not invent.
-- If count is between 3 and 8: proceed directly to content generation.
-- If count is above 8: apply combining rules before generating copy.
-Print your count and which rule you are applying before generating output.
+==================================================
+OUTPUT REQUIREMENTS
+==================================================
+Return a raw JSON array only. No markdown. No commentary.
+Each item must be:
+{
+  "name": "Verb-led Title Case title (3-5 words)",
+  "description": "Description between 100 and 200 characters (minimum 100, maximum 200)",
+  "mediaUrl": "preserved from input",
+  "combinedFrom": ["name1", "name2"] or null
+}
+Preserve the final itinerary order.
 
-COMBINING RULES (only if count is above 8):
-- Only combine experiences that are adjacent in the list
-- Only combine if they are the same type (both pass-by, or both the same activity category like walks, viewpoints, wildlife)
-- Never combine more than 3 experiences into one highlight
-- Use the mediaUrl of the highest-significance experience in the combined group
-- If after applying these rules the count is still above 8, that is acceptable — do not force-combine unrelated experiences
+==================================================
+COUNT RULES (apply first, in order)
+==================================================
+1) If total count is below 3:
+- Expand the thinnest experiences into sub-moments using source material only
+- Do not invent details
+- Shared context across expanded sub-moments is acceptable if source-grounded
+2) If total count is between 3 and 8:
+- Proceed directly to content generation
+3) If total count is above 8:
+- Combine adjacent experiences of the same type (max 3 per group)
+- Preserve chronology
+- For combined cards, write one description that captures the thread connecting the grouped moments
+- For combined cards, use the mediaUrl of the first item in the group that has a non-null mediaUrl
 
-CONTENT GENERATION RULES:
-- One highlight per final experience (or combined group)
-- Title: verb-led, 3–5 words, Title Case
-- Description: 100–200 characters. Rich, sensory, specific. Count carefully.
-- For contextQuality "low": describe the atmosphere, character, and what makes this place or moment distinctive — draw on general knowledge of the place but omit specific numbers, statistics, or facts not present in the provided description
-- For pass-by experiences: be honest about brevity but make it atmospheric ("One moment you're in mountain light; 1.2km of blasted rock later, the fiord opens below.")
-- For combined highlights: write a description that captures the thread connecting the grouped experiences
+==================================================
+WHAT MAKES A STRONG CARD (MOST IMPORTANT)
+==================================================
+A strong itinerary card describes a moment the traveler can picture.
+Do NOT write like a generic inclusion list:
+- "Visit X. See Y. Learn Z."
+Instead, write like:
+- what appears first
+- what the traveler is physically doing
+- what specific detail stands out
+- how the scene changes (before/after, inside/outside, road/site/view)
+- what makes this stop feel distinct from the others
+Each card should answer:
+"What does this part of the day actually look like?"
 
-Style reference:
-- "Marvel at Stonehenge — Step inside the outer circle and feel the weight of 4,500 years pressing down. The stones are bigger than photos suggest — and the silence between them, stranger."
-- "Pass Through Homer Tunnel — One moment you're in mountain light; 1.2km of blasted rock later, the fiord side opens below you."
-- "Explore the Visitor Centre — Over 250 artefacts excavated from the surrounding plain — tools, jewellery, bones — laid out in the order they were pulled from the earth."
+==================================================
+MOMENT-FIRST WRITING FRAME (choose one primary angle per card)
+==================================================
+Before writing, choose ONE angle that best fits the stop:
+1. Arrival Moment
+   - First visual impression, approach, entry, reveal
+2. Action Moment
+   - Walking, browsing, boarding, passing through, stepping inside
+3. Transition Moment
+   - Tunnel, ferry crossing, drive segment, moving from one setting to another
+4. Observation Moment
+   - One specific thing people notice here (artefacts, chapel ceiling, bluestones, cliff edge)
+5. Contrast Moment
+   - Shift in scale, light, noise, terrain, architecture, or pace (only if source-supported)
+6. Scale/Proximity Moment
+   - Counts, distances, duration, size, density (only if source-supported)
+Use facts to support the moment. Do not force drama.
 
-The experiences below are provided in the exact order they occur in the itinerary. Preserve this order exactly in your output. Do not reorder.
+==================================================
+VOICE + STYLE (Headout)
+==================================================
+Tone:
+- Conversational
+- Clear
+- Grounded
+- Knowledgeable friend, not brochure copy
+
+Writing style:
+- Active voice only
+- Contractions are fine
+- Specificity over atmosphere
+- Lightly evocative language is allowed only when supported by source data
+- For low-context stops, stick to factual description only
+- Prefer concrete nouns over abstract mood words
+
+Write with experiential clarity, not poetic excess.
+
+==================================================
+DETAIL SELECTION PRIORITY
+==================================================
+For each card, use details in this order:
+1. Numbers (counts, durations, distances, dates/ages if explicitly present)
+2. Proper nouns (landmarks, routes, named places)
+3. Distinct physical details (artefacts, tunnel, chapel, bluestones, ferry, cliff, etc.)
+4. What happens at this stop (walk, enter, browse, pass through, board, look out)
+5. Logistics only if it adds specificity (audio guide, transfer, multilingual support)
+
+If a useful number is present, prefer using it.
+
+==================================================
+TITLE RULES
+==================================================
+- Verb-led
+- 3-5 words only
+- Title Case
+- Should reflect what happens in the moment (not just the place name)
+
+Prefer concrete verbs:
+Enter, Walk, Browse, Pass Through, Board, Cross, Take In, Look Out Over, See, Stop At, Ride
+
+Avoid weak/generic verbs unless no better option fits:
+Explore, Experience, Enjoy, Discover, Marvel
+
+Examples:
+- Weak: "Explore Windsor Castle"
+- Better: "Enter Windsor Castle"
+- Weak: "Walk Around Stonehenge" (acceptable but generic)
+- Better: "Circle The Stonehenge Site" (if source supports movement around site)
+
+==================================================
+DESCRIPTION RULES
+==================================================
+- Between 100 and 200 characters total (minimum 100, maximum 200)
+- Count carefully before outputting
+- Factual and source-grounded
+- Lead with the most specific image/detail available
+- One highlight/moment per card
+- No duplication across different stops
+- Rewrite supplier-style copy into plain, experiential, factual language
+
+IMPORTANT:
+A good description should help a traveler imagine the sequence of the day.
+It should not read like a Wikipedia line or a package inclusion list.
+Use this pattern when useful (not mandatory):
+- concrete action + specific detail + grounded context
+OR
+- scene shift + physical detail + what this stop adds to the day
+
+For pass-by stops:
+- Be honest about brevity
+- Still make the moment legible and specific if supported by source
+
+For low-context stops:
+- Use only explicit source details (name, type, passBy, sequence, provided description)
+- Do not add unsupported sensory/historical claims
+- If specificity is thin, write cleanly and concretely rather than becoming generic or poetic
+
+==================================================
+HARD RULES (MUST NEVER BREAK)
+==================================================
+Never invent:
+- facts
+- timings
+- statistics
+- access details
+- sensory details
+- historical claims not present in source data
+
+Never use these words:
+- amazing
+- magical
+- breathtaking
+- stunning
+- beautiful
+- incredible
+
+Never use these phrases:
+- you will
+- guests can
+- this experience
+- visitors are invited
+
+Avoid brochure/promo wording:
+- iconic
+- world-famous
+- must-see
+- unmissable
+(Prefer factual rewrites.)
+
+No filler:
+- enjoy your visit
+- make memories
+- arrive on time
+
+No personas:
+- perfect for families
+- ideal for couples
+
+==================================================
+ANTI-REPETITION RULES
+==================================================
+- Don't repeat the same fact across different stops
+- Don't write every card in the same sentence pattern
+- If one card uses the key number/detail, others should use different specifics where possible
+- Each card should feel like a different moment in the itinerary
+
+Carve-out:
+- When expanding one stop into sub-moments (count below 3), shared context is acceptable if source-grounded
+
+==================================================
+QUALITY BAR (EXPERIENTIAL, FACTUAL, SPECIFIC)
+==================================================
+Strong examples (moment-first, not brochure-first):
+- "Enter the Stone Circle" — "You're within 10 metres of the actual bluestones. Bigger than photos suggest, stranger than history books prepare you for."
+- "Browse the Visitor Centre" — "250 artefacts excavated from the surrounding plain: tools, jewellery, and bones pulled from the earth over decades of digs."
+- "Pass Through Homer Tunnel" — "One moment you're in mountain light. Then 1.2km of blasted rock. Then the fiord opens below."
+
+Why these work:
+- They describe a moment, not just a landmark
+- They use specific nouns/numbers
+- They create mental pictures without hype
+- They stay grounded
+
+==================================================
+FINAL VALIDATION (DO SILENTLY BEFORE OUTPUT)
+==================================================
+For each item, verify:
+- title is verb-led, 3-5 words, Title Case
+- description is 100-200 characters
+- description reads like a moment, not a generic inclusion line
+- no banned words/phrases
+- no invented facts
+- mediaUrl preserved
+- combinedFrom is correct (array or null)
+If any rule fails, rewrite before outputting.`;
+
+    const _call2DurationText = durationText || (() => { console.warn("[Call 2] durationText unavailable, using fallback."); return "Not specified"; })();
+    const _call2ModeOfTravel = modeOfTravel || (() => { console.warn("[Call 2] modeOfTravel unavailable, using fallback."); return "Not specified"; })();
+
+    const call2UserPrompt = `Experience: ${experienceName}
+City: ${cityName}
+Duration: ${_call2DurationText}
+Mode of travel: ${_call2ModeOfTravel}
+
+Below is the cleaned list of sub-experiences for this tour. Apply the count rules, then generate final itinerary card copy.
 
 [EXPERIENCE LIST]
-${JSON.stringify(sortedList, null, 2)}
-
-Output a raw JSON array only — no markdown, no explanation:
-[
-  {
-    "name": "Rewritten Title",
-    "description": "200–300 character immersive description",
-    "mediaUrl": "preserved from input",
-    "combinedFrom": ["name1", "name2"] or null
-  }
-]`;
+${JSON.stringify(sortedList.map(({ name, description, mediaUrl, passBy }) => ({ name, description, mediaUrl, passBy })), null, 2)}`;
 
     console.log("EXPERIENCE COUNT GOING INTO CALL 2:", sortedList.length);
 
     const call2Completion = await openai.chat.completions.create({
       model: "gpt-4o",
-      temperature: 0.7,
+      temperature: 0,
       messages: [
         { role: "system", content: call2SystemPrompt },
         { role: "user", content: call2UserPrompt },
@@ -550,19 +851,11 @@ Output a raw JSON array only — no markdown, no explanation:
     try {
       call2Result = JSON.parse(call2Cleaned);
     } catch {
-      return res.status(500).json({
-        success: false,
-        error: "Call 2 (content generation) returned output that could not be parsed. Please try again.",
-        rawOutput: call2Raw,
-      });
+      throw new Error("Call 2 (content generation) returned output that could not be parsed. Please try again.");
     }
 
     if (!Array.isArray(call2Result)) {
-      return res.status(500).json({
-        success: false,
-        error: "Call 2 (content generation) returned an unexpected structure. Please try again.",
-        rawOutput: call2Raw,
-      });
+      throw new Error("Call 2 (content generation) returned an unexpected structure. Please try again.");
     }
 
     // -----------------------------------------------------------------
@@ -611,16 +904,100 @@ Output a raw JSON array only — no markdown, no explanation:
     // Strip sortRank from the public response shape
     const sections = finalSections.map(({ sortRank: _sr, ...rest }) => rest);
 
-    return res.json({
-      success: true,
-      data: { sections },
-    });
+    return { experienceId: id, experienceName, sections };
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+// Single experience
+app.post("/api/generate", async (req, res) => {
+  const { experienceId } = req.body;
+
+  if (!experienceId || String(experienceId).trim() === "") {
+    return res.status(400).json({ success: false, error: "Experience ID is required." });
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ success: false, error: "OPENAI_API_KEY is not configured on the server." });
+  }
+
+  try {
+    const result = await generateForExperience(String(experienceId).trim());
+    return res.json({ success: true, data: { sections: result.sections } });
   } catch (err) {
+    if (err instanceof NoItineraryError) {
+      return res.status(400).json({ success: false, error: err.message });
+    }
     console.error("[/api/generate error]", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || "An unexpected server error occurred.",
-    });
+    return res.status(500).json({ success: false, error: err.message || "An unexpected server error occurred." });
+  }
+});
+
+// Collection — generates one result block per experience in the collection
+app.post("/api/generate-collection", async (req, res) => {
+  const { collectionId } = req.body;
+
+  if (!collectionId || String(collectionId).trim() === "") {
+    return res.status(400).json({ success: false, error: "Collection ID is required." });
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ success: false, error: "OPENAI_API_KEY is not configured on the server." });
+  }
+
+  const cid = String(collectionId).trim();
+
+  try {
+    // Fetch collection and extract all experience IDs from tourGroups
+    const collectionUrl = `https://api.headout.com/api/v1/collection/${cid}/tour-groups`;
+    const collectionData = await fetchJson(collectionUrl);
+
+    // v6 collections endpoint returns tourGroups array directly; fall back to results for other shapes
+    const tourGroups = collectionData?.tourGroups ?? collectionData?.results ?? collectionData?.data;
+    if (!Array.isArray(tourGroups) || tourGroups.length === 0) {
+      console.log("Collection API response keys:", Object.keys(collectionData || {}));
+      return res.status(400).json({ success: false, error: "No tour groups found in this collection." });
+    }
+
+    const experienceIds = tourGroups.map((tg) => String(tg.id)).filter(Boolean);
+    console.log(`Collection ${cid}: found ${experienceIds.length} experiences:`, experienceIds);
+
+    // Generate itinerary for each experience sequentially to avoid rate limits.
+    // Each experience is raced against a 120s timeout to prevent one slow call
+    // from stalling the entire collection.
+    const EXPERIENCE_TIMEOUT_MS = 120_000;
+    const experiences = [];
+    for (const expId of experienceIds) {
+      console.log(`Generating for experience ${expId}…`);
+      try {
+        const result = await Promise.race([
+          generateForExperience(expId),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Timed out after ${EXPERIENCE_TIMEOUT_MS / 1000}s`)), EXPERIENCE_TIMEOUT_MS)
+          ),
+        ]);
+        experiences.push(result);
+      } catch (expErr) {
+        if (expErr instanceof NoItineraryError) {
+          // Skip silently — experience has no itinerary, nothing to generate
+          console.log(`Skipping experience ${expId}: no itinerary data.`);
+          continue;
+        }
+        console.error(`Failed for experience ${expId}:`, expErr.message);
+        // Include a failed entry so the frontend can show a partial result
+        experiences.push({
+          experienceId: expId,
+          experienceName: `Experience ${expId}`,
+          sections: [],
+          error: expErr.message,
+        });
+      }
+    }
+
+    return res.json({ success: true, data: { collectionId: cid, experiences } });
+  } catch (err) {
+    console.error("[/api/generate-collection error]", err);
+    return res.status(500).json({ success: false, error: err.message || "An unexpected server error occurred." });
   }
 });
 
