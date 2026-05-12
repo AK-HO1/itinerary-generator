@@ -104,7 +104,7 @@ function buildMergedImagePool(productImages, stopSections) {
 // Core generation logic
 // ---------------------------------------------------------------------------
 
-async function generateForExperience(id, productImages = []) {
+async function generateForExperience(id, productImages = null) {
     // -----------------------------------------------------------------
     // 1. Fetch Experience API + Itinerary API in parallel
     // -----------------------------------------------------------------
@@ -115,6 +115,11 @@ async function generateForExperience(id, productImages = []) {
       fetchJson(experienceUrl),
       fetchJson(itineraryUrl),
     ]);
+
+    // If no product images were passed (single experience mode), extract from API response
+    if (productImages === null) {
+      productImages = experience.media?.productImages || [];
+    }
 
     const experienceName = experience.name || "Untitled Experience";
     const cityName = experience.city?.displayName || "";
@@ -754,7 +759,7 @@ ${JSON.stringify(imagePoolForPrompt, null, 2)}`;
 // Routes
 // ---------------------------------------------------------------------------
 
-// Single experience (no product images — itinerary images only)
+// Single experience
 app.post("/api/generate", async (req, res) => {
   const { experienceId } = req.body;
 
