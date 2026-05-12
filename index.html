@@ -568,9 +568,9 @@
         // Thumbnail
         const thumb = document.createElement("div");
         thumb.className = "stop-thumb";
-        if (section.mediaUrls && section.mediaUrls[0]) {
+        if (section.imageUrl) {
           const img = document.createElement("img");
-          img.src = section.mediaUrls[0];
+          img.src = section.imageUrl;
           img.alt = section.name;
           img.loading = "lazy";
           img.onerror = () => { img.replaceWith(makePlaceholder(section.name)); };
